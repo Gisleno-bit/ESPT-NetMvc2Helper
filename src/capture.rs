@@ -141,8 +141,11 @@ pub struct PeerView {
 #[derive(Clone, Default)]
 pub struct Candidato {
     pub ip: String,
-    pub pps: f64,
-    pub valve: bool,
+    pub pps_in: f64,
+    pub pps_out: f64,
+    pub mean_ms: f64,
+    /// true si cumple la firma de un netcode de 60 Hz.
+    pub es_juego: bool,
 }
 
 #[derive(Clone, Default)]
@@ -154,6 +157,8 @@ pub struct Snapshot {
     pub valve_pps: f64,
     pub otros: usize,
     pub grabando: bool,
+    /// Si esta activo, acepta cualquier flujo (para depurar).
+    pub laxo: bool,
     // --- diagnostico ---
     pub total_ip: u64,
     pub total_udp: u64,
@@ -172,6 +177,22 @@ struct Peer {
     intervalos: VecDeque<f64>,
     entrantes: VecDeque<Instant>,
     salientes: VecDeque<Instant>,
+}
+
+/// Firma de un netcode de juego de pelea a 60 Hz:
+///  - flujo entrante sostenido (>= 30 pps)
+///  - bidireccional y simetrico (ni un lado 3x el otro)
+///  - intervalo medio corto (<= 50 ms)
+fn parece_juego(pps_in: f64, pps_out: f64, mean_ms: f64) -> bool {
+    if pps_in < 30.0 || pps_out < 30.0 {
+        return false;
+    }
+    if mean_ms <= 0.0 || mean_ms > 50.0 {
+        return false;
+    }
+    let mayor = pps_in.max(pps_out);
+    let menor = pps_in.min(pps_out).max(0.001);
+    mayor / menor <= 3.0
 }
 
 impl Peer {
@@ -466,17 +487,36 @@ pub fn hilo_captura(estado: Compartido) {
         // Tabla de diagnostico: todo lo publico que se esta viendo.
         let mut candidatos: Vec<Candidato> = peers
             .iter()
-            .map(|(ip, p)| Candidato {
-                ip: ip.to_string(),
-                pps: p.pps_in() + p.pps_out(),
-                valve: false,
+            .map(|(ip, p)| {
+                let (media, _, _, _) = p.stats();
+                Candidato {
+                    ip: ip.to_string(),
+                    pps_in: p.pps_in(),
+                    pps_out: p.pps_out(),
+                    mean_ms: media,
+                    es_juego: parece_juego(p.pps_in(), p.pps_out(), media),
+                }
             })
             .collect();
-        candidatos.sort_by(|a, b| b.pps.partial_cmp(&a.pps).unwrap_or(std::cmp::Ordering::Equal));
+        candidatos.sort_by(|a, b| {
+            (b.pps_in + b.pps_out)
+                .partial_cmp(&(a.pps_in + a.pps_out))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         candidatos.truncate(6);
+
+        let laxo_actual = { estado.lock().unwrap().laxo };
 
         let mejor = peers
             .iter()
+            .filter(|(_, p)| {
+                let (media, _, _, _) = p.stats();
+                if laxo_actual {
+                    p.pps_in() + p.pps_out() >= 5.0
+                } else {
+                    parece_juego(p.pps_in(), p.pps_out(), media)
+                }
+            })
             .max_by(|a, b| {
                 let x = a.1.pps_in() + a.1.pps_out();
                 let y = b.1.pps_in() + b.1.pps_out();
@@ -484,10 +524,7 @@ pub fn hilo_captura(estado: Compartido) {
             })
             .map(|(ip, p)| (*ip, p));
 
-        let vista = mejor.and_then(|(ip, p)| {
-            if p.pps_in() + p.pps_out() < 5.0 {
-                return None;
-            }
+        let vista = mejor.map(|(ip, p)| {
             let (media, jitter, pico, huecos) = p.stats();
             let hist: Vec<f32> = p
                 .intervalos
@@ -497,7 +534,7 @@ pub fn hilo_captura(estado: Compartido) {
                 .rev()
                 .map(|v| *v as f32)
                 .collect();
-            Some(PeerView {
+            PeerView {
                 ip: ip.to_string(),
                 pps_in: p.pps_in(),
                 pps_out: p.pps_out(),
@@ -507,7 +544,7 @@ pub fn hilo_captura(estado: Compartido) {
                 huecos,
                 rtt_ms: None,
                 hist,
-            })
+            }
         });
 
         let grabar;
