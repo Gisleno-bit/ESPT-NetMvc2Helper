@@ -124,6 +124,14 @@ pub fn es_privada(ip: Ipv4Addr) -> bool {
 //  Estado compartido con la interfaz
 // ---------------------------------------------------------------
 
+/// Un tiron concreto: cuando llego, cuanto duro, cuantos frames costo.
+#[derive(Clone, Default)]
+pub struct Incidente {
+    pub hace_s: f64,
+    pub ms: f64,
+    pub frames: u32,
+}
+
 #[derive(Clone, Default)]
 pub struct PeerView {
     pub ip: String,
@@ -131,10 +139,17 @@ pub struct PeerView {
     pub pps_out: f64,
     pub mean_ms: f64,
     pub jitter_ms: f64,
+    pub p99_ms: f64,
     pub max_gap_ms: f64,
     pub huecos: u64,
     pub rtt_ms: Option<u32>,
     pub hist: Vec<f32>,
+    // --- incidentes ---
+    pub incidentes: Vec<Incidente>,
+    pub total_incidentes: u64,
+    pub peor_frames: u32,
+    pub inc_por_min: f64,
+    pub minutos: f64,
 }
 
 /// Una linea de la tabla de diagnostico: cualquier IP publica vista.
@@ -174,35 +189,54 @@ pub type Compartido = Arc<Mutex<Snapshot>>;
 struct Peer {
     ultimo: Option<Instant>,
     visto: Instant,
+    inicio: Instant,
     intervalos: VecDeque<f64>,
     entrantes: VecDeque<Instant>,
     salientes: VecDeque<Instant>,
+    /// Tirones registrados (momento, duracion en ms).
+    incidentes: VecDeque<(Instant, f64)>,
+    total_incidentes: u64,
+    peor_ms: f64,
 }
 
-/// Firma de un netcode de juego de pelea a 60 Hz:
-///  - flujo entrante sostenido (>= 30 pps)
-///  - bidireccional y simetrico (ni un lado 3x el otro)
-///  - intervalo medio corto (<= 50 ms)
-fn parece_juego(pps_in: f64, pps_out: f64, mean_ms: f64) -> bool {
+/// Firma de un netcode de juego de pelea a 60 Hz.
+/// Umbrales apretados en v0.4 tras colarse trafico de chat/web:
+///  - flujo sostenido en ambos sentidos (>= 30 pps)
+///  - intervalo entre 10 y 25 ms (cubre 40-100 Hz, descarta el resto)
+///  - simetrico de verdad (ni un lado 2x el otro)
+///  - jitter por debajo de 60 ms (ningun flujo de juego jugable pasa de ahi)
+fn parece_juego(pps_in: f64, pps_out: f64, mean_ms: f64, jitter_ms: f64) -> bool {
     if pps_in < 30.0 || pps_out < 30.0 {
         return false;
     }
-    if mean_ms <= 0.0 || mean_ms > 50.0 {
+    if mean_ms < 10.0 || mean_ms > 25.0 {
+        return false;
+    }
+    if jitter_ms > 60.0 {
         return false;
     }
     let mayor = pps_in.max(pps_out);
     let menor = pps_in.min(pps_out).max(0.001);
-    mayor / menor <= 3.0
+    mayor / menor <= 2.0
 }
+
+/// Umbral a partir del cual un intervalo cuenta como tiron perceptible.
+/// 50 ms son ~3 frames a 60 fps: por debajo de eso no se siente.
+const UMBRAL_INCIDENTE_MS: f64 = 50.0;
+const FRAME_MS: f64 = 1000.0 / 60.0;
 
 impl Peer {
     fn nuevo() -> Self {
         Peer {
             ultimo: None,
             visto: Instant::now(),
+            inicio: Instant::now(),
             intervalos: VecDeque::with_capacity(300),
             entrantes: VecDeque::with_capacity(300),
             salientes: VecDeque::with_capacity(300),
+            incidentes: VecDeque::with_capacity(64),
+            total_incidentes: 0,
+            peor_ms: 0.0,
         }
     }
 
@@ -214,6 +248,16 @@ impl Peer {
                 self.intervalos.push_back(ms);
                 if self.intervalos.len() > 300 {
                     self.intervalos.pop_front();
+                }
+                if ms > UMBRAL_INCIDENTE_MS {
+                    self.total_incidentes += 1;
+                    if ms > self.peor_ms {
+                        self.peor_ms = ms;
+                    }
+                    self.incidentes.push_back((ahora, ms));
+                    if self.incidentes.len() > 64 {
+                        self.incidentes.pop_front();
+                    }
                 }
             }
         }
@@ -244,9 +288,10 @@ impl Peer {
         self.salientes.len() as f64 / 2.0
     }
 
-    fn stats(&self) -> (f64, f64, f64, u64) {
+    /// Devuelve (media, jitter, p99, pico, huecos).
+    fn stats(&self) -> (f64, f64, f64, f64, u64) {
         if self.intervalos.len() < 3 {
-            return (0.0, 0.0, 0.0, 0);
+            return (0.0, 0.0, 0.0, 0.0, 0);
         }
         let n = self.intervalos.len() as f64;
         let media: f64 = self.intervalos.iter().sum::<f64>() / n;
@@ -260,7 +305,28 @@ impl Peer {
         let pico = self.intervalos.iter().cloned().fold(0.0_f64, f64::max);
         let umbral = (media * 3.0).max(50.0);
         let huecos = self.intervalos.iter().filter(|x| **x > umbral).count() as u64;
-        (media, jitter, pico, huecos)
+
+        // P99: el intervalo que solo supera el 1% peor. La distancia
+        // entre la mediana y el P99 ES la sensacion de inestabilidad.
+        let mut orden: Vec<f64> = self.intervalos.iter().cloned().collect();
+        orden.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((orden.len() as f64 * 0.99).ceil() as usize).saturating_sub(1);
+        let p99 = orden[idx.min(orden.len() - 1)];
+
+        (media, jitter, p99, pico, huecos)
+    }
+
+    fn vista_incidentes(&self, ahora: Instant) -> Vec<Incidente> {
+        self.incidentes
+            .iter()
+            .rev()
+            .take(8)
+            .map(|(t, ms)| Incidente {
+                hace_s: ahora.duration_since(*t).as_secs_f64(),
+                ms: *ms,
+                frames: (ms / FRAME_MS).round() as u32,
+            })
+            .collect()
     }
 }
 
@@ -488,13 +554,13 @@ pub fn hilo_captura(estado: Compartido) {
         let mut candidatos: Vec<Candidato> = peers
             .iter()
             .map(|(ip, p)| {
-                let (media, _, _, _) = p.stats();
+                let (media, jit, _, _, _) = p.stats();
                 Candidato {
                     ip: ip.to_string(),
                     pps_in: p.pps_in(),
                     pps_out: p.pps_out(),
                     mean_ms: media,
-                    es_juego: parece_juego(p.pps_in(), p.pps_out(), media),
+                    es_juego: parece_juego(p.pps_in(), p.pps_out(), media, jit),
                 }
             })
             .collect();
@@ -510,11 +576,11 @@ pub fn hilo_captura(estado: Compartido) {
         let mejor = peers
             .iter()
             .filter(|(_, p)| {
-                let (media, _, _, _) = p.stats();
+                let (media, jit, _, _, _) = p.stats();
                 if laxo_actual {
                     p.pps_in() + p.pps_out() >= 5.0
                 } else {
-                    parece_juego(p.pps_in(), p.pps_out(), media)
+                    parece_juego(p.pps_in(), p.pps_out(), media, jit)
                 }
             })
             .max_by(|a, b| {
@@ -525,7 +591,8 @@ pub fn hilo_captura(estado: Compartido) {
             .map(|(ip, p)| (*ip, p));
 
         let vista = mejor.map(|(ip, p)| {
-            let (media, jitter, pico, huecos) = p.stats();
+            let (media, jitter, p99, pico, huecos) = p.stats();
+            let minutos = ahora.duration_since(p.inicio).as_secs_f64() / 60.0;
             let hist: Vec<f32> = p
                 .intervalos
                 .iter()
@@ -540,10 +607,20 @@ pub fn hilo_captura(estado: Compartido) {
                 pps_out: p.pps_out(),
                 mean_ms: media,
                 jitter_ms: jitter,
+                p99_ms: p99,
                 max_gap_ms: pico,
                 huecos,
                 rtt_ms: None,
                 hist,
+                incidentes: p.vista_incidentes(ahora),
+                total_incidentes: p.total_incidentes,
+                peor_frames: (p.peor_ms / FRAME_MS).round() as u32,
+                inc_por_min: if minutos > 0.05 {
+                    p.total_incidentes as f64 / minutos
+                } else {
+                    0.0
+                },
+                minutos,
             }
         });
 
@@ -584,15 +661,18 @@ pub fn hilo_captura(estado: Compartido) {
                 {
                     let _ = writeln!(
                         f,
-                        "{},{},{:.1},{:.1},{:.2},{:.2},{:.1},{},{}",
+                        "{},{},{:.1},{:.1},{:.2},{:.2},{:.2},{:.1},{},{},{},{}",
                         ts,
                         p.ip,
                         p.pps_in,
                         p.pps_out,
                         p.mean_ms,
                         p.jitter_ms,
+                        p.p99_ms,
                         p.max_gap_ms,
                         p.huecos,
+                        p.total_incidentes,
+                        p.peor_frames,
                         p.rtt_ms.map(|v| v.to_string()).unwrap_or_default()
                     );
                 }
