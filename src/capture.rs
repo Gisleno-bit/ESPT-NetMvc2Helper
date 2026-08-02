@@ -74,8 +74,7 @@ const WSAETIMEDOUT: i32 = 10060;
 //  Rangos de red conocidos
 // ---------------------------------------------------------------
 
-/// Prefijos de Valve (AS32590). Best-effort: Valve alquila rangos
-/// nuevos con frecuencia, asi que esto no es exhaustivo.
+/// Prefijos de Valve (AS32590). Best-effort.
 const RANGOS_VALVE: &[(&str, u32)] = &[
     ("45.121.184.0", 22),
     ("103.10.124.0", 23),
@@ -116,7 +115,7 @@ pub fn es_privada(ip: Ipv4Addr) -> bool {
         || (o[0] == 192 && o[1] == 168)
         || (o[0] == 169 && o[1] == 254)
         || o[0] == 127
-        || (o[0] == 100 && (64..128).contains(&o[1])) // CGNAT
+        || (o[0] == 100 && (64..128).contains(&o[1]))
         || o[0] == 0
         || o[0] >= 224
 }
@@ -138,6 +137,14 @@ pub struct PeerView {
     pub hist: Vec<f32>,
 }
 
+/// Una linea de la tabla de diagnostico: cualquier IP publica vista.
+#[derive(Clone, Default)]
+pub struct Candidato {
+    pub ip: String,
+    pub pps: f64,
+    pub valve: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub activo: bool,
@@ -147,6 +154,10 @@ pub struct Snapshot {
     pub valve_pps: f64,
     pub otros: usize,
     pub grabando: bool,
+    // --- diagnostico ---
+    pub total_ip: u64,
+    pub total_udp: u64,
+    pub candidatos: Vec<Candidato>,
 }
 
 pub type Compartido = Arc<Mutex<Snapshot>>;
@@ -178,7 +189,6 @@ impl Peer {
         self.visto = ahora;
         if let Some(prev) = self.ultimo {
             let ms = ahora.duration_since(prev).as_secs_f64() * 1000.0;
-            // Descarta valores absurdos (pausa larga, cambio de partida)
             if ms < 2000.0 {
                 self.intervalos.push_back(ms);
                 if self.intervalos.len() > 300 {
@@ -213,7 +223,6 @@ impl Peer {
         self.salientes.len() as f64 / 2.0
     }
 
-    /// Media, desviacion tipica (jitter), pico y numero de huecos.
     fn stats(&self) -> (f64, f64, f64, u64) {
         if self.intervalos.len() < 3 {
             return (0.0, 0.0, 0.0, 0);
@@ -228,8 +237,6 @@ impl Peer {
             / n;
         let jitter = var.sqrt();
         let pico = self.intervalos.iter().cloned().fold(0.0_f64, f64::max);
-        // Un hueco = intervalo mayor que 3 veces la media. En un flujo
-        // a 60 Hz eso implica paquetes perdidos o retenidos.
         let umbral = (media * 3.0).max(50.0);
         let huecos = self.intervalos.iter().filter(|x| **x > umbral).count() as u64;
         (media, jitter, pico, huecos)
@@ -250,7 +257,7 @@ pub fn ip_local() -> Option<Ipv4Addr> {
 }
 
 // ---------------------------------------------------------------
-//  Ping ICMP (hilo aparte, no bloquea la captura)
+//  Ping ICMP
 // ---------------------------------------------------------------
 
 fn ping(handle: isize, ip: Ipv4Addr) -> Option<u32> {
@@ -275,7 +282,6 @@ fn ping(handle: isize, ip: Ipv4Addr) -> Option<u32> {
     if n == 0 {
         return None;
     }
-    // ICMP_ECHO_REPLY: Address(4) Status(4) RoundTripTime(4)
     let status = u32::from_le_bytes([reply[4], reply[5], reply[6], reply[7]]);
     if status != 0 {
         return None;
@@ -319,6 +325,8 @@ pub fn hilo_captura(estado: Compartido) {
         }
     };
 
+    println!("[netmon] IP local detectada: {}", local);
+
     {
         let mut s = estado.lock().unwrap();
         s.ip_local = local.to_string();
@@ -331,10 +339,12 @@ pub fn hilo_captura(estado: Compartido) {
 
     let sock = unsafe { socket(AF_INET, SOCK_RAW, IPPROTO_IP) };
     if sock == INVALID_SOCKET {
+        let e = unsafe { WSAGetLastError() };
+        println!("[netmon] socket() fallo: {}", e);
         let mut s = estado.lock().unwrap();
         s.error = Some(format!(
-            "No he podido abrir el socket ({}). Ejecuta como ADMINISTRADOR.",
-            unsafe { WSAGetLastError() }
+            "socket() fallo ({}). Ejecuta como ADMINISTRADOR.",
+            e
         ));
         return;
     }
@@ -346,8 +356,10 @@ pub fn hilo_captura(estado: Compartido) {
         sin_zero: [0; 8],
     };
     if unsafe { bind(sock, &dir, std::mem::size_of::<SockAddrIn>() as i32) } == SOCKET_ERROR {
+        let e = unsafe { WSAGetLastError() };
+        println!("[netmon] bind() fallo: {}", e);
         let mut s = estado.lock().unwrap();
-        s.error = Some(format!("bind() fallo ({}).", unsafe { WSAGetLastError() }));
+        s.error = Some(format!("bind() fallo ({}).", e));
         return;
     }
 
@@ -367,15 +379,16 @@ pub fn hilo_captura(estado: Compartido) {
         )
     } == SOCKET_ERROR
     {
+        let e = unsafe { WSAGetLastError() };
+        println!("[netmon] SIO_RCVALL fallo: {}", e);
         let mut s = estado.lock().unwrap();
         s.error = Some(format!(
             "SIO_RCVALL fallo ({}). Hace falta ADMINISTRADOR.",
-            unsafe { WSAGetLastError() }
+            e
         ));
         return;
     }
 
-    // Timeout de recepcion para que el bucle no se quede colgado.
     let timeout: u32 = 200;
     unsafe {
         setsockopt(
@@ -387,6 +400,8 @@ pub fn hilo_captura(estado: Compartido) {
         );
     }
 
+    println!("[netmon] captura activa. Escuchando...");
+
     {
         let mut s = estado.lock().unwrap();
         s.activo = true;
@@ -397,17 +412,21 @@ pub fn hilo_captura(estado: Compartido) {
     let mut valve: VecDeque<Instant> = VecDeque::new();
     let mut ultimo_calculo = Instant::now();
     let mut ultimo_log = Instant::now();
+    let mut total_ip: u64 = 0;
+    let mut total_udp: u64 = 0;
 
     loop {
         let n = unsafe { recv(sock, buf.as_mut_ptr(), buf.len() as i32, 0) };
         let ahora = Instant::now();
 
         if n > 0 {
+            total_ip += 1;
             let n = n as usize;
             if n >= 20 {
                 let ihl = ((buf[0] & 0x0f) as usize) * 4;
                 let proto = buf[9];
                 if proto == 17 && n >= ihl + 8 {
+                    total_udp += 1;
                     let src = Ipv4Addr::new(buf[12], buf[13], buf[14], buf[15]);
                     let dst = Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
 
@@ -429,7 +448,6 @@ pub fn hilo_captura(estado: Compartido) {
             }
         }
 
-        // Recalcular cada 250 ms
         if ahora.duration_since(ultimo_calculo) < Duration::from_millis(250) {
             continue;
         }
@@ -445,7 +463,18 @@ pub fn hilo_captura(estado: Compartido) {
             p.podar(ahora);
         }
 
-        // El peer de la partida = el que mas paquetes por segundo mueve.
+        // Tabla de diagnostico: todo lo publico que se esta viendo.
+        let mut candidatos: Vec<Candidato> = peers
+            .iter()
+            .map(|(ip, p)| Candidato {
+                ip: ip.to_string(),
+                pps: p.pps_in() + p.pps_out(),
+                valve: false,
+            })
+            .collect();
+        candidatos.sort_by(|a, b| b.pps.partial_cmp(&a.pps).unwrap_or(std::cmp::Ordering::Equal));
+        candidatos.truncate(6);
+
         let mejor = peers
             .iter()
             .max_by(|a, b| {
@@ -456,7 +485,6 @@ pub fn hilo_captura(estado: Compartido) {
             .map(|(ip, p)| (*ip, p));
 
         let vista = mejor.and_then(|(ip, p)| {
-            // Umbral: por debajo de 5 pps no es una partida, es ruido.
             if p.pps_in() + p.pps_out() < 5.0 {
                 return None;
             }
@@ -498,10 +526,12 @@ pub fn hilo_captura(estado: Compartido) {
             });
             s.valve_pps = valve.len() as f64 / 2.0;
             s.otros = peers.len();
+            s.total_ip = total_ip;
+            s.total_udp = total_udp;
+            s.candidatos = candidatos;
             grabar = s.grabando;
         }
 
-        // Log CSV una vez por segundo
         if grabar && ahora.duration_since(ultimo_log) >= Duration::from_secs(1) {
             ultimo_log = ahora;
             let s = estado.lock().unwrap();
