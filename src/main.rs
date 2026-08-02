@@ -1,4 +1,4 @@
-// v0.2 - ventana normal y consola visible, para diagnosticar.
+// v0.3 - deteccion estricta por firma de netcode 60 Hz.
 // La consola se deja a proposito: cualquier error sale ahi.
 
 mod capture;
@@ -24,7 +24,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let opciones = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([360.0, 460.0])
+            .with_inner_size([400.0, 540.0])
             .with_decorations(true)
             .with_transparent(false)
             .with_resizable(true),
@@ -55,6 +55,7 @@ impl eframe::App for App {
         let s = self.estado.lock().unwrap().clone();
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("MvC NetMon");
                 let (txt, col) = if s.error.is_some() {
@@ -78,11 +79,11 @@ impl eframe::App for App {
                 return;
             }
 
-            // --- Metricas del rival ---
             match &s.peer {
                 None => {
                     ui.add_space(8.0);
-                    ui.label("Sin partida detectada todavia.");
+                    ui.label("Sin partida detectada.");
+                    ui.weak("Busco un flujo simetrico a ~60 Hz.");
                     ui.add_space(8.0);
                 }
                 Some(p) => {
@@ -136,7 +137,6 @@ impl eframe::App for App {
 
             ui.separator();
 
-            // --- Diagnostico ---
             ui.collapsing("Diagnostico", |ui| {
                 egui::Grid::new("diag").num_columns(2).show(ui, |ui| {
                     ui.label("IP local");
@@ -160,24 +160,49 @@ impl eframe::App for App {
                     ui.end_row();
                 });
 
-                ui.add_space(6.0);
-                ui.label("IPs vistas (mas trafico primero):");
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Flujos vistos").strong());
+                ui.weak("verde = cumple la firma de un juego");
+                ui.add_space(4.0);
+
                 if s.candidatos.is_empty() {
-                    ui.weak("ninguna todavia");
+                    ui.weak("ninguno todavia");
                 } else {
-                    for c in &s.candidatos {
-                        ui.label(format!("  {}  -  {:.0} pps", c.ip, c.pps));
-                    }
+                    egui::Grid::new("cands").num_columns(4).striped(true).show(ui, |ui| {
+                        ui.label(egui::RichText::new("IP").weak());
+                        ui.label(egui::RichText::new("in").weak());
+                        ui.label(egui::RichText::new("out").weak());
+                        ui.label(egui::RichText::new("interv.").weak());
+                        ui.end_row();
+
+                        for c in &s.candidatos {
+                            let col = if c.es_juego {
+                                egui::Color32::from_rgb(90, 220, 110)
+                            } else {
+                                egui::Color32::GRAY
+                            };
+                            ui.colored_label(col, &c.ip);
+                            ui.colored_label(col, format!("{:.0}", c.pps_in));
+                            ui.colored_label(col, format!("{:.0}", c.pps_out));
+                            ui.colored_label(col, format!("{:.0} ms", c.mean_ms));
+                            ui.end_row();
+                        }
+                    });
                 }
             });
 
             ui.separator();
 
-            // --- Controles ---
             let mut grabando = s.grabando;
             if ui.checkbox(&mut grabando, "Grabar log CSV").changed() {
                 self.estado.lock().unwrap().grabando = grabando;
             }
+
+            let mut laxo = s.laxo;
+            if ui.checkbox(&mut laxo, "Modo laxo (acepta cualquier flujo)").changed() {
+                self.estado.lock().unwrap().laxo = laxo;
+            }
+            ui.weak("Solo para depurar. Engancha Discord y demas.");
 
             if ui.checkbox(&mut self.overlay, "Modo overlay").changed() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.overlay));
@@ -187,7 +212,7 @@ impl eframe::App for App {
                     egui::WindowLevel::Normal
                 }));
             }
-            ui.weak("El overlay quita bordes y fija la ventana encima.");
+            });
         });
     }
 }
