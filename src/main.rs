@@ -1,5 +1,5 @@
-// Oculta la consola en release, deja la ventana negra en debug.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// v0.2 - ventana normal y consola visible, para diagnosticar.
+// La consola se deja a proposito: cualquier error sale ahi.
 
 mod capture;
 
@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn main() -> Result<(), eframe::Error> {
+    println!("[netmon] arrancando...");
+
     let estado: Compartido = Arc::new(Mutex::new(Snapshot::default()));
 
     {
@@ -22,245 +24,210 @@ fn main() -> Result<(), eframe::Error> {
 
     let opciones = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([300.0, 250.0])
-            .with_position([24.0, 24.0])
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_mouse_passthrough(true)
-            .with_resizable(false),
+            .with_inner_size([360.0, 460.0])
+            .with_decorations(true)
+            .with_transparent(false)
+            .with_resizable(true),
         ..Default::default()
     };
 
     eframe::run_native(
         "MvC NetMon",
         opciones,
-        Box::new(|_cc| Box::new(App { estado })),
+        Box::new(|_cc| {
+            Box::new(App {
+                estado,
+                overlay: false,
+            })
+        }),
     )
 }
 
 struct App {
     estado: Compartido,
+    overlay: bool,
 }
 
 impl eframe::App for App {
-    fn clear_color(&self, _v: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
-    }
-
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(120));
+        ctx.request_repaint_after(Duration::from_millis(150));
 
         let s = self.estado.lock().unwrap().clone();
 
-        let marco = egui::Frame::none()
-            .fill(egui::Color32::from_rgba_unmultiplied(8, 10, 14, 205))
-            .rounding(8.0)
-            .inner_margin(egui::Margin::same(11.0))
-            .stroke(egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(90, 100, 120, 130),
-            ));
-
-        egui::CentralPanel::default().frame(marco).show(ctx, |ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-
+        egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("MvC NetMon")
-                        .color(egui::Color32::from_rgb(120, 200, 255))
-                        .strong()
-                        .size(13.0),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (txt, col) = if s.error.is_some() {
-                        ("ERROR", egui::Color32::from_rgb(255, 90, 90))
-                    } else if !s.activo {
-                        ("iniciando", egui::Color32::GRAY)
-                    } else if s.peer.is_some() {
-                        ("en partida", egui::Color32::from_rgb(120, 230, 130))
-                    } else {
-                        ("esperando", egui::Color32::from_rgb(220, 190, 90))
-                    };
-                    ui.label(egui::RichText::new(txt).color(col).size(11.0));
-                });
+                ui.heading("MvC NetMon");
+                let (txt, col) = if s.error.is_some() {
+                    ("ERROR", egui::Color32::from_rgb(255, 90, 90))
+                } else if !s.activo {
+                    ("iniciando", egui::Color32::GRAY)
+                } else if s.peer.is_some() {
+                    ("EN PARTIDA", egui::Color32::from_rgb(90, 220, 110))
+                } else {
+                    ("esperando", egui::Color32::from_rgb(220, 190, 90))
+                };
+                ui.label(egui::RichText::new(txt).color(col).strong());
             });
 
             ui.separator();
 
             if let Some(e) = &s.error {
-                ui.label(
-                    egui::RichText::new(e)
-                        .color(egui::Color32::from_rgb(255, 120, 120))
-                        .size(11.0),
-                );
+                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
+                ui.add_space(6.0);
+                ui.label("Cierra y abre como administrador.");
                 return;
             }
 
+            // --- Metricas del rival ---
             match &s.peer {
                 None => {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("Sin partida activa.")
-                            .color(egui::Color32::GRAY)
-                            .size(11.0),
-                    );
-                    ui.label(
-                        egui::RichText::new("Entra en un combate online.")
-                            .color(egui::Color32::DARK_GRAY)
-                            .size(10.0),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(format!("Steam/Valve: {:.0} pps", s.valve_pps))
-                            .color(egui::Color32::DARK_GRAY)
-                            .size(10.0),
-                    );
+                    ui.add_space(8.0);
+                    ui.label("Sin partida detectada todavia.");
+                    ui.add_space(8.0);
                 }
                 Some(p) => {
-                    ui.label(
-                        egui::RichText::new(format!("rival  {}", p.ip))
-                            .color(egui::Color32::from_rgb(200, 210, 225))
-                            .size(11.0),
-                    );
+                    ui.label(format!("Rival: {}", p.ip));
+                    ui.add_space(4.0);
 
-                    ui.add_space(3.0);
-
-                    // JITTER: la metrica principal
                     let (cj, etiqueta) = calidad_jitter(p.jitter_ms);
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(format!("{:.1}", p.jitter_ms))
                                 .color(cj)
                                 .strong()
-                                .size(30.0),
+                                .size(34.0),
                         );
                         ui.vertical(|ui| {
-                            ui.add_space(9.0);
-                            ui.label(
-                                egui::RichText::new("ms jitter")
-                                    .color(egui::Color32::GRAY)
-                                    .size(11.0),
-                            );
-                            ui.label(egui::RichText::new(etiqueta).color(cj).size(11.0));
+                            ui.add_space(10.0);
+                            ui.label("ms jitter");
+                            ui.colored_label(cj, etiqueta);
                         });
                     });
 
                     grafico(ui, &p.hist, p.mean_ms);
+                    ui.add_space(4.0);
 
-                    ui.add_space(3.0);
+                    egui::Grid::new("stats").num_columns(2).show(ui, |ui| {
+                        ui.label("ping ICMP");
+                        match p.rtt_ms {
+                            Some(v) => ui.label(format!("{} ms", v)),
+                            None => ui.label("sin respuesta"),
+                        };
+                        ui.end_row();
 
-                    fila(
-                        ui,
-                        "ping ICMP",
-                        match p.rtt_ms {
-                            Some(v) => format!("{} ms", v),
-                            None => "sin respuesta".into(),
-                        },
-                        match p.rtt_ms {
-                            Some(v) if v < 40 => egui::Color32::from_rgb(120, 230, 130),
-                            Some(v) if v < 90 => egui::Color32::from_rgb(230, 210, 110),
-                            Some(_) => egui::Color32::from_rgb(240, 130, 110),
-                            None => egui::Color32::DARK_GRAY,
-                        },
-                    );
-                    fila(
-                        ui,
-                        "intervalo",
-                        format!("{:.1} ms", p.mean_ms),
-                        egui::Color32::from_rgb(190, 200, 215),
-                    );
-                    fila(
-                        ui,
-                        "paquetes",
-                        format!("{:.0} in / {:.0} out", p.pps_in, p.pps_out),
-                        egui::Color32::from_rgb(190, 200, 215),
-                    );
-                    fila(
-                        ui,
-                        "pico",
-                        format!("{:.0} ms", p.max_gap_ms),
-                        if p.max_gap_ms > 100.0 {
-                            egui::Color32::from_rgb(240, 130, 110)
-                        } else {
-                            egui::Color32::from_rgb(190, 200, 215)
-                        },
-                    );
-                    fila(
-                        ui,
-                        "huecos",
-                        format!("{}", p.huecos),
-                        if p.huecos > 0 {
-                            egui::Color32::from_rgb(240, 130, 110)
-                        } else {
-                            egui::Color32::from_rgb(120, 230, 130)
-                        },
-                    );
+                        ui.label("intervalo");
+                        ui.label(format!("{:.1} ms", p.mean_ms));
+                        ui.end_row();
+
+                        ui.label("paquetes");
+                        ui.label(format!("{:.0} in / {:.0} out", p.pps_in, p.pps_out));
+                        ui.end_row();
+
+                        ui.label("pico");
+                        ui.label(format!("{:.0} ms", p.max_gap_ms));
+                        ui.end_row();
+
+                        ui.label("huecos");
+                        ui.label(format!("{}", p.huecos));
+                        ui.end_row();
+                    });
                 }
             }
+
+            ui.separator();
+
+            // --- Diagnostico ---
+            ui.collapsing("Diagnostico", |ui| {
+                egui::Grid::new("diag").num_columns(2).show(ui, |ui| {
+                    ui.label("IP local");
+                    ui.label(&s.ip_local);
+                    ui.end_row();
+
+                    ui.label("paquetes IP");
+                    ui.label(format!("{}", s.total_ip));
+                    ui.end_row();
+
+                    ui.label("de ellos UDP");
+                    ui.label(format!("{}", s.total_udp));
+                    ui.end_row();
+
+                    ui.label("Steam/Valve");
+                    ui.label(format!("{:.0} pps", s.valve_pps));
+                    ui.end_row();
+
+                    ui.label("IPs publicas");
+                    ui.label(format!("{}", s.otros));
+                    ui.end_row();
+                });
+
+                ui.add_space(6.0);
+                ui.label("IPs vistas (mas trafico primero):");
+                if s.candidatos.is_empty() {
+                    ui.weak("ninguna todavia");
+                } else {
+                    for c in &s.candidatos {
+                        ui.label(format!("  {}  -  {:.0} pps", c.ip, c.pps));
+                    }
+                }
+            });
+
+            ui.separator();
+
+            // --- Controles ---
+            let mut grabando = s.grabando;
+            if ui.checkbox(&mut grabando, "Grabar log CSV").changed() {
+                self.estado.lock().unwrap().grabando = grabando;
+            }
+
+            if ui.checkbox(&mut self.overlay, "Modo overlay").changed() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.overlay));
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.overlay {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                }));
+            }
+            ui.weak("El overlay quita bordes y fija la ventana encima.");
         });
     }
-}
-
-fn fila(ui: &mut egui::Ui, nombre: &str, valor: String, color: egui::Color32) {
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(nombre)
-                .color(egui::Color32::from_rgb(110, 120, 135))
-                .size(11.0),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(valor).color(color).size(11.0));
-        });
-    });
 }
 
 fn calidad_jitter(j: f64) -> (egui::Color32, &'static str) {
     if j <= 0.0 {
         (egui::Color32::GRAY, "midiendo")
     } else if j < 3.0 {
-        (egui::Color32::from_rgb(120, 230, 130), "excelente")
+        (egui::Color32::from_rgb(90, 220, 110), "excelente")
     } else if j < 7.0 {
-        (egui::Color32::from_rgb(180, 220, 120), "bien")
+        (egui::Color32::from_rgb(170, 215, 110), "bien")
     } else if j < 15.0 {
-        (egui::Color32::from_rgb(235, 205, 110), "regular")
+        (egui::Color32::from_rgb(230, 200, 100), "regular")
     } else {
-        (egui::Color32::from_rgb(240, 120, 110), "malo")
+        (egui::Color32::from_rgb(235, 110, 100), "malo")
     }
 }
 
-/// Grafico de barras de los ultimos intervalos entre paquetes.
 fn grafico(ui: &mut egui::Ui, hist: &[f32], media: f64) {
-    let alto = 34.0;
     let (resp, pintor) =
-        ui.allocate_painter(egui::vec2(ui.available_width(), alto), egui::Sense::hover());
+        ui.allocate_painter(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
     let r = resp.rect;
 
     pintor.rect_filled(
         r,
         3.0,
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
     );
 
-    if hist.is_empty() {
+    if hist.is_empty() || media <= 0.0 {
         return;
     }
 
-    // Escala: el doble de la media, con minimo de 30 ms.
     let techo = ((media * 2.0) as f32).max(30.0);
     let ancho = r.width() / hist.len() as f32;
 
-    // Linea de la media
     let y_media = r.bottom() - (media as f32 / techo).clamp(0.0, 1.0) * r.height();
     pintor.line_segment(
-        [
-            egui::pos2(r.left(), y_media),
-            egui::pos2(r.right(), y_media),
-        ],
-        egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(120, 200, 255, 70),
-        ),
+        [egui::pos2(r.left(), y_media), egui::pos2(r.right(), y_media)],
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 200, 255)),
     );
 
     for (i, v) in hist.iter().enumerate() {
